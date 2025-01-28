@@ -1,123 +1,178 @@
-import requests
-import logging
-import json
+import os
 import math
-import time
+import aiohttp
+import asyncio
+import logging
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 
-def calculate_distance(lat1, lng1, lat2, lng2):
-    """Calculate the Haversine distance between two GPS points."""
-    R = 6371.0  # Earth's radius in kilometers, more precise with a float
-    # Convert degrees to radians
-    lat1, lng1, lat2, lng2 = map(math.radians, [lat1, lng1, lat2, lng2])
-    # Differences in latitude and longitude
-    dlat = lat2 - lat1
-    dlng = lng2 - lng1
-    # Haversine formula
-    a = math.sin(dlat / 2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng / 2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    distance = R * c
-    return distance 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def parse_data(line):
-    """Parse a single line of data into a JSON object."""
-    try:
-        parsed_data = json.loads(line)
-        logging.debug(f"Parsed data: {parsed_data}")
-        return parsed_data
-    except json.JSONDecodeError as e:
-        logging.warning(f"Failed to decode JSON: {e}. Line: {line}")
-        return None
+class Config:
+    BASE_URL = "http://localhost:6000/stream"
+    BATCH_SIZE = 16  
+    CORES = os.cpu_count()
+    MAX_CONCURRENT_REQUESTS = min(CORES or 1 * 4, 64)
+    EARTH_RADIUS_KM = 6371.0  # Earth's radius in kilometers
 
 
-def process_gps_data(previous_point, current_gps):
-    """Extract GPS data and calculate the distance from the previous point."""
-    try:
-        lat = float(current_gps.get("lat", 0))
-        lng = float(current_gps.get("lng", 0))
+class GPSUtils:
+    @staticmethod
+    def haversine_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+        """Calculate the Haversine distance between two GPS points."""
+        lat1, lng1, lat2, lng2 = map(math.radians, [lat1, lng1, lat2, lng2])
+        dlat = lat2 - lat1
+        dlng = lng2 - lng1
+        a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng / 2) ** 2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return Config.EARTH_RADIUS_KM * c
 
-        # Skip processing if the coordinates are identical
-        if previous_point and lat == previous_point["lat"] and lng == previous_point["lng"]:
-            logging.info(f"Skipping identical GPS point: {current_gps}")
-            return 0, previous_point
+    @staticmethod
+    def process_gps(previous_point: Optional[Dict[str, float]], current_gps: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
+        """
+        Extract GPS data and calculate the distance from the previous point.
+        Always returns a valid dictionary for the next point.
+        """
+        try:
+            lat = float(current_gps.get("lat", 0))
+            lng = float(current_gps.get("lng", 0))
 
-        if previous_point is not None:
-            distance = calculate_distance(
-                previous_point["lat"], previous_point["lng"], lat, lng
-            )
-            logging.info(f"Latest distance calculated: {distance:.6f} km")
-            return distance, {"lat": lat, "lng": lng}
+            if previous_point and lat == previous_point["lat"] and lng == previous_point["lng"]:
+                return 0.0, previous_point
 
-        # For the first data point
-        return 0, {"lat": lat, "lng": lng}
-    except (TypeError, ValueError) as e:
-        logging.warning(f"Invalid GPS data encountered: {current_gps}, Error: {e}")
-        return 0, previous_point
-    
+            if previous_point:
+                distance = GPSUtils.haversine_distance(previous_point["lat"], previous_point["lng"], lat, lng)
+                return distance, {"lat": lat, "lng": lng}
+            
+            return 0.0, {"lat": lat, "lng": lng}
+        
+        except (ValueError, TypeError, KeyError) as e:
+            logging.warning(f"Invalid GPS data encountered: {current_gps}, Error: {e}")
+            return 0.0, previous_point
 
-def fetch_and_process_data(url):
-    """Fetch data from the server and calculate the total distance incrementally."""
-    logging.debug("Starting to fetch and process data from the server...")
-    retry_count = 0
-    max_retries = 3
-    total_distance = 0.0
-    total_points = 0
-    previous_point = None
+class DataUtils:
+    @staticmethod
+    def sort_by_timestamp(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Sort data by the GPS read_timestamp field."""
+        try:
+            return sorted(data, key=lambda x: x["gps"]["read_timestamp"])
+        except (KeyError, TypeError):
+            return []
 
-    # Create a persistent session
-    with requests.Session() as session:
-        while True:
+
+class DataFetcher:
+    def __init__(self, url: str, batch_size: int, max_concurrent_requests: int):
+        self.url = url
+        self.batch_size = batch_size
+        self.semaphore = asyncio.Semaphore(max_concurrent_requests)
+        self.stop_event = asyncio.Event()
+
+    async def fetch_sample(self, session: aiohttp.ClientSession, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Fetch a single sample from the server."""
+        async with self.semaphore:
+            if self.stop_event.is_set():
+                return None
+
             try:
-                response = session.get(url, stream=True)
-                logging.debug(f"Received response with status code: {response.status_code}")
-                if response.status_code == 404:
-                    logging.info("No more data available from the server.")
+                async with session.get(self.url, params=params) as response:
+                    if self.stop_event.is_set():  # Check if a 404 has already been encountered
+                        return None
+                    elif response.status == 200:
+                        return await response.json()
+                    elif response.status == 404:
+                        self.stop_event.set()
+                        logging.info("Received 404. Stopping further requests.")
+                    else:
+                        logging.warning(f"Unexpected status {response.status} for params {params}")
+            except aiohttp.ClientError as e:
+                logging.error(f"Client error while fetching sample with params {params}: {e}")
+            except asyncio.TimeoutError:
+                logging.error(f"Request timed out for params {params}")
+            except Exception as e:
+                logging.error(f"Unexpected error while fetching sample with params {params}: {e}")
+            return None
+
+    async def fetch_batch(self, session: aiohttp.ClientSession, batch_index: int) -> List[Dict[str, Any]]:
+        """Fetch a batch of data using parallel sample fetches."""
+        logging.info(f"Starting to fetch batch {batch_index}...")
+        try:
+            tasks = [
+                self.fetch_sample(session, {"batch_index": batch_index, "sample_index": i})
+                for i in range(self.batch_size)
+            ]
+            results = await asyncio.gather(*tasks)
+
+            #Handle exceptions in results
+            valid_results = []
+            for result in results:
+                if isinstance(result, Exception):
+                    logging.error(f"Task failed with exception: {result}")
+                elif result is not None:
+                    valid_results.append(result)
+            
+            return valid_results
+        
+        except Exception as e:
+            logging.error(f"Unexpected error while fetching batch {batch_index}: {e}")
+            return []
+
+    async def async_data_generator(self, session: aiohttp.ClientSession) -> AsyncGenerator[List[Dict[str, Any]], None]:
+        """Generate batches of data asynchronously."""
+        batch_index = 1
+        while not self.stop_event.is_set():
+            try:
+                batch = await self.fetch_batch(session, batch_index)
+                if not batch:
                     break
-
-                response.raise_for_status()
-
-                json_buffer = ""
-                for line in response.iter_lines(decode_unicode=True):
-                    if line:
-                        json_buffer += line.strip()
-                        if json_buffer.startswith("{") and json_buffer.endswith("}"):
-                            data = parse_data(json_buffer)
-                            json_buffer = ""  # Reset buffer for the next object
-
-                            if data is None:
-                                continue
-
-                            gps_data = data.get("gps")
-                            if not gps_data:
-                                logging.warning(f"Missing GPS data in: {data}")
-                                continue
-
-                            distance, previous_point = process_gps_data(previous_point, gps_data)
-                            total_distance += distance
-                            total_points += 1
-
-            except requests.ConnectionError as e:
-                retry_count += 1
-                logging.error(f"Connection error: {e}. Retrying {retry_count}/{max_retries}...")
-                if retry_count >= max_retries:
-                    logging.error("Max retries reached. Terminating.")
-                    break
-                time.sleep(2)
-            except requests.RequestException as e:
-                logging.error(f"Request error: {e}. Terminating.")
+                yield batch
+                batch_index += 1
+            except Exception as e:
+                logging.error(f"Error in async_data_generator for batch {batch_index}: {e}")
                 break
 
-    logging.info(f"Final total distance: {total_distance:.6f} km")
-    logging.info(f"Total data points processed: {total_points}")
-    return total_distance, total_points
+# --- MAIN PROCESSING ---
+class DataProcessor:
+    def __init__(self):
+        self.total_distance = 0.0
+        self.total_points = 0
+        self.previous_point = None
+        self.processed_ids = set()
+
+    async def process_batch(self, batch: List[Dict[str, Any]]):
+        """Process a single batch of data."""
+        sorted_batch = DataUtils.sort_by_timestamp(batch)
+        for sample in sorted_batch:
+            gps_data = sample.get("gps")
+            frame_data = sample.get("frame")
+
+            if gps_data and frame_data:
+                unique_id = (gps_data.get("read_timestamp"), frame_data.get("frame_id"))
+                if unique_id in self.processed_ids:
+                    continue
+
+                self.processed_ids.add(unique_id)
+                distance, self.previous_point = GPSUtils.process_gps(self.previous_point, gps_data)
+                self.total_distance += distance
+                logging.info(f"Current Distance: {self.total_distance:.6f} km")
+
+    async def process_data(self, url: str, batch_size: int, max_concurrent_requests: int):
+        """Fetch and process data from the server."""
+        fetcher = DataFetcher(url, batch_size, max_concurrent_requests)
+
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=max_concurrent_requests)) as session:
+            async for batch in fetcher.async_data_generator(session):
+                await self.process_batch(batch)
+
+        self.total_points = len(self.processed_ids)
+        logging.info(f"Final Total Distance: {self.total_distance:.6f} km")
+        logging.info(f"Total Points Processed: {self.total_points}")
 
 
-def main():
-    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
-    url = "http://localhost:6000/stream"
-    total_distance, total_points = fetch_and_process_data(url)
-    logging.info(f"Summary: Total Distance = {total_distance:.2f} km, Total Points = {total_points}")
+async def main():
+    processor = DataProcessor()
+    await processor.process_data(Config.BASE_URL, Config.BATCH_SIZE, Config.MAX_CONCURRENT_REQUESTS)
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
